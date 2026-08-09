@@ -37,23 +37,30 @@ warnings.filterwarnings('ignore')
 #https://github.com/kobiso/CBAM-keras
 #https://github.com/titu1994/keras-squeeze-excite-network
 
-class DenseBlock(Layer):
-    def __init__(self, num_layers, growth_rate, kernel_size=3):
-        super(DenseBlock, self).__init__()
-        self.num_layers = num_layers
-        self.growth_rate = growth_rate
-        self.kernel_size = kernel_size
-        self.conv_layers = [Conv2D(growth_rate, kernel_size=kernel_size, padding='same') for _ in range(num_layers)]
 
-    def call(self, inputs):
-        x = inputs
-        outputs = [x]  
-        for conv in self.conv_layers:
-            x = conv(x)
-            x = LeakyReLU(alpha=0.05)(x)
-            outputs.append(x) 
-            x = Concatenate(axis=-1)(outputs) 
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.layers import Conv2D
+
+def ResidualBlock(filters):
+    def block(x_input):
+        x = Conv2D(filters, (3, 3), padding='same', kernel_regularizer=l2(1e-4))(x_input)
+        x = BatchNormalization()(x)
+        x = LeakyReLU(alpha=0.05)(x)
+        x = SpatialDropout2D(0.2)(x)
+
+        x = Conv2D(filters, (3, 3), padding='same', kernel_regularizer=l2(1e-4))(x)
+        x = BatchNormalization()(x)
+
+        # If number of filters doesn't match, project input
+        if x_input.shape[-1] != filters:
+            x_input = Conv2D(filters, (1,1), padding='same', kernel_regularizer=l2(1e-4))(x_input)
+            x_input = BatchNormalization()(x_input)
+
+        x = Add()([x, x_input])
+        x = LeakyReLU(alpha=0.05)(x)
         return x
+    return block
+
 
 class AttentionModule(Layer):
     def __init__(self, num_heads):
@@ -65,7 +72,6 @@ class AttentionModule(Layer):
         attn_output = self.attention(patches, patches)
         return self.layer_norm(attn_output + patches)  
         
-
 
 class SEBlock(Layer):
     def __init__(self, ratio=16):
@@ -141,74 +147,266 @@ print(f"Training data shape: {X_train.shape}")
 print(f"Testing data shape: {X_test.shape}")
 
 
+class DenseBlock(Layer):
 
-class MultiScalePatches(Layer):
-    def __init__(self, patch_sizes, projection_dim):
-        super(MultiScalePatches, self).__init__()
-        self.patch_sizes = patch_sizes
-        self.projection_dim = projection_dim
-        self.projection_layers = [Dense(projection_dim) for _ in patch_sizes]
+    def __init__(self,
+                 num_layers=3,
+                 growth_rate=32):
 
-    def call(self, images):
-        batch_size = tf.shape(images)[0]
-        patches_list = []
-        for i, patch_size in enumerate(self.patch_sizes):
-            patches = tf.image.extract_patches(
-                images=images,
-                sizes=[1, patch_size, patch_size, 1],
-                strides=[1, patch_size, patch_size, 1],
-                rates=[1, 1, 1, 1],
-                padding="VALID",
+        super().__init__()
+
+        self.blocks = []
+
+        for _ in range(num_layers):
+
+            self.blocks.append(
+                tf.keras.Sequential([
+                    Conv2D(growth_rate,
+                           3,
+                           padding='same',
+                           use_bias=False),
+
+                    BatchNormalization(),
+
+                    LeakyReLU(0.05)
+                ])
             )
-            patch_dims = patches.shape[-1]
-            patches = tf.reshape(patches, [batch_size, -1, patch_dims])
-            projected_patches = self.projection_layers[i](patches)  # Project to the same dimension
-            patches_list.append(projected_patches)
-        return tf.concat(patches_list, axis=1)
 
-def get_hybrid_model(input_shape):
-    input_img = Input(input_shape)
+    def call(self, x):
 
-    patch_sizes = [16, 32, 48]
-    projection_dim = 64
-    patches = MultiScalePatches(patch_sizes, projection_dim)(input_img)
+        feats = [x]
 
-    attn_output = AttentionModule(num_heads=8)(patches)
+        for block in self.blocks:
 
-    num_patches = sum([(input_shape[0] // patch_size) * (input_shape[1] // patch_size) for patch_size in patch_sizes])
-    patch_depth = projection_dim
+            y = block(x)
 
-    attn_output = Reshape((num_patches, patch_depth))(attn_output)
-    x = Reshape((num_patches, patch_depth, 1))(attn_output)
-    x = DenseBlock(num_layers=3, growth_rate=32)(x)  # First dense block
-    x = SEBlock(32)(x)  
-    x = MaxPooling2D(2, 2)(x)
+            feats.append(y)
 
-    x = DenseBlock(num_layers=3, growth_rate=64)(x)  # Second dense block
-    x = SEBlock(64)(x)  
-    x = MaxPooling2D(2, 2)(x)
+            x = Concatenate()(feats)
 
-    x = DenseBlock(num_layers=3, growth_rate=128)(x)  # Third dense block 
-    x = SEBlock(128)(x) 
-    x = MaxPooling2D(2, 2)(x)
+        return x
 
-    x = DenseBlock(num_layers=3, growth_rate=256)(x)  # Fourth dense block
-    x = SEBlock(256)(x)  
-    x = MaxPooling2D(2, 2)(x)
-    
+class SEBlock(Layer):
+
+    def __init__(self, ratio=16):
+        super().__init__()
+        self.ratio = ratio
+
+    def build(self, input_shape):
+
+        c = input_shape[-1]
+
+        self.gap = GlobalAveragePooling2D()
+
+        self.fc1 = Dense(max(c // self.ratio, 8),
+                         activation='relu')
+
+        self.fc2 = Dense(c,
+                         activation='sigmoid')
+
+        self.reshape = Reshape((1,1,c))
+
+    def call(self, x):
+
+        s = self.gap(x)
+        s = self.fc1(s)
+        s = self.fc2(s)
+        s = self.reshape(s)
+
+        return Multiply()([x,s])
 
 
-    
+
+class MultiScalePatchEmbedding(Layer):
+    def __init__(self, embed_dim=128, patch_sizes=[8, 16, 32]):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.patch_sizes = patch_sizes
+
+        # split embedding properly but ensure recombination = 128
+        self.proj_layers = [
+            Conv2D(embed_dim, kernel_size=p, strides=p, padding='valid')
+            for p in patch_sizes
+        ]
+
+        self.fuse = Dense(embed_dim) 
+
+    def call(self, x):
+        multi_feats = []
+
+        for conv in self.proj_layers:
+            f = conv(x)
+            h = tf.shape(f)[1]
+            w = tf.shape(f)[2]
+            f = tf.reshape(f, (-1, h * w, f.shape[-1]))
+            multi_feats.append(f)
+
+        # concatenate tokens
+        x = Concatenate(axis=1)(multi_feats)
+
+        # project back to correct dimension (128)
+        x = self.fuse(x)
+
+        return x
+
+class TransformerBlock(Layer):
+
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=4):
+
+        super().__init__()
+
+        self.attn = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=embed_dim
+        )
+
+        self.norm1 = LayerNormalization()
+
+        self.norm2 = LayerNormalization()
+
+        self.ffn = tf.keras.Sequential([
+            Dense(embed_dim*2,
+                  activation='gelu'),
+            Dense(embed_dim)
+        ])
+
+    def call(self, x):
+
+        a = self.attn(x,x)
+
+        x = self.norm1(x+a)
+
+        f = self.ffn(x)
+
+        x = self.norm2(x+f)
+
+        return x
+
+ 
+class CrossAttentionFusion(Layer):
+
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=4):
+        super().__init__()
+
+        self.attn = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=embed_dim
+        )
+
+        self.norm = LayerNormalization()
+
+    def call(self, cnn_feat, vit_feat):
+
+        cnn_feat = tf.expand_dims(cnn_feat, axis=1)
+        vit_feat = tf.expand_dims(vit_feat, axis=1)
+
+        attn_out = self.attn(
+            query=cnn_feat,
+            key=vit_feat,
+            value=vit_feat
+        )
+
+        fused = self.norm(attn_out + cnn_feat)
+
+        return tf.squeeze(fused, axis=1)
 
 
-    x = Flatten()(x)
-    x = Dense(512)(x)
-    x = LeakyReLU(alpha=0.05)(x)
-    x = Dropout(0.05)(x)
-    x = Dense(3, activation='softmax')(x)
-    model = Model(inputs=[input_img], outputs=[x])
+
+def get_hybrid_model_dense(input_shape):
+
+    inputs = Input(shape=input_shape)
+
+
+    cnn = Conv2D(
+        32,
+        3,
+        padding='same',
+        activation='relu'
+    )(inputs)
+
+    cnn = DenseBlock(
+        3,
+        32
+    )(cnn)
+
+    cnn = SEBlock()(cnn)
+
+    cnn = MaxPooling2D(2)(cnn)
+
+    cnn = DenseBlock(
+        3,
+        64
+    )(cnn)
+
+    cnn = SEBlock()(cnn)
+
+    cnn = MaxPooling2D(2)(cnn)
+
+    cnn = Conv2D(
+        128,
+        3,
+        padding='same',
+        activation='relu'
+    )(cnn)
+
+    cnn = GlobalAveragePooling2D()(cnn)
+
+ 
+
+    vit = MultiScalePatchEmbedding(
+    embed_dim=128,
+    patch_sizes=[8, 16, 32]
+)(inputs)
+
+    vit = TransformerBlock(
+        embed_dim=128,
+        num_heads=4
+    )(vit)
+
+    vit = TransformerBlock(
+        embed_dim=128,
+        num_heads=4
+    )(vit)
+
+    vit = GlobalAveragePooling1D()(vit)
+
+ 
+
+    fusion = Concatenate()([
+        cnn,
+        vit
+    ])
+
+    fusion = Dense(
+        256,
+        activation='relu'
+    )(fusion)
+
+    fusion = Dropout(0.3)(fusion)
+
+    fusion = Dense(
+        128,
+        activation='relu'
+    )(fusion)
+
+    fusion = Dropout(0.2)(fusion)
+
+    outputs = Dense(
+        1,
+        activation='sigmoid'
+    )(fusion)
+
+    model = Model(
+        inputs,
+        outputs
+    )
+
     return model
-
  
 
 def compute_multiclass_eer(y_true, y_pred_proba, num_classes):
@@ -250,7 +448,7 @@ for fold, (train_index, test_index) in enumerate(kf.split(X_data)):
     X_train, X_val, Y_train, Y_val = train_test_split(X_train_full, Y_train_full, test_size=0.1, random_state=42)
 
   
-    model = get_hybrid_model(input_shape)
+    model = get_hybrid_model_dense(input_shape)
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
                   loss='categorical_crossentropy',
                   metrics=['accuracy'])
