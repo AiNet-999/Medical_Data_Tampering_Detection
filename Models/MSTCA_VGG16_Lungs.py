@@ -1,6 +1,14 @@
 import os
 import argparse
 import cv2
+import tensorflow as tf
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import Model
+from tensorflow.keras.regularizers import l2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import Model
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -141,73 +149,216 @@ print(f"Testing data shape: {X_test.shape}")
 
 
 
-class MultiScalePatches(Layer):
-    def __init__(self, patch_sizes, projection_dim):
-        super(MultiScalePatches, self).__init__()
-        self.patch_sizes = patch_sizes
-        self.projection_dim = projection_dim
-        self.projection_layers = [Dense(projection_dim) for _ in patch_sizes]
+class VGGBlock(Layer):
 
-    def call(self, images):
-        batch_size = tf.shape(images)[0]
-        patches_list = []
-        for i, patch_size in enumerate(self.patch_sizes):
-            patches = tf.image.extract_patches(
-                images=images,
-                sizes=[1, patch_size, patch_size, 1],
-                strides=[1, patch_size, patch_size, 1],
-                rates=[1, 1, 1, 1],
-                padding="VALID",
+    def __init__(self, filters, num_convs=2):
+        super().__init__()
+
+        self.convs = []
+
+        for _ in range(num_convs):
+            self.convs.append(
+                Conv2D(filters, 3, padding='same', use_bias=False)
             )
-            patch_dims = patches.shape[-1]
-            patches = tf.reshape(patches, [batch_size, -1, patch_dims])
-            projected_patches = self.projection_layers[i](patches)  # Project to the same dimension
-            patches_list.append(projected_patches)
-        return tf.concat(patches_list, axis=1)
+            self.convs.append(BatchNormalization())
+            self.convs.append(LeakyReLU(0.05))
 
-def get_hybrid_model(input_shape):
-    input_img = Input(input_shape)
+        self.pool = MaxPooling2D(2)
 
-    patch_sizes = [16, 32, 48]
-    projection_dim = 64
-    patches = MultiScalePatches(patch_sizes, projection_dim)(input_img)
+    def call(self, x):
 
-    attn_output = AttentionModule(num_heads=8)(patches)
+        for layer in self.convs:
+            x = layer(x)
 
-    num_patches = sum([(input_shape[0] // patch_size) * (input_shape[1] // patch_size) for patch_size in patch_sizes])
-    patch_depth = projection_dim
+        x = self.pool(x)
+        return x
 
-    attn_output = Reshape((num_patches, patch_depth))(attn_output)
-    x = Reshape((num_patches, patch_depth, 1))(attn_output)
+class SEBlock(Layer):
+
+    def __init__(self, ratio=16):
+        super().__init__()
+        self.ratio = ratio
+
+    def build(self, input_shape):
+
+        c = input_shape[-1]
+
+        self.gap = GlobalAveragePooling2D()
+
+        self.fc1 = Dense(max(c // self.ratio, 8),
+                         activation='relu')
+
+        self.fc2 = Dense(c,
+                         activation='sigmoid')
+
+        self.reshape = Reshape((1,1,c))
+
+    def call(self, x):
+
+        s = self.gap(x)
+        s = self.fc1(s)
+        s = self.fc2(s)
+        s = self.reshape(s)
+
+        return Multiply()([x,s])
+
+
+
+class MultiScalePatchEmbedding(Layer):
+    def __init__(self, embed_dim=128, patch_sizes=[8, 16, 32]):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.patch_sizes = patch_sizes
+
+        # split embedding properly but ensure recombination = 128
+        self.proj_layers = [
+            Conv2D(embed_dim, kernel_size=p, strides=p, padding='valid')
+            for p in patch_sizes
+        ]
+
+        self.fuse = Dense(embed_dim) 
+
+    def call(self, x):
+        multi_feats = []
+
+        for conv in self.proj_layers:
+            f = conv(x)
+            h = tf.shape(f)[1]
+            w = tf.shape(f)[2]
+            f = tf.reshape(f, (-1, h * w, f.shape[-1]))
+            multi_feats.append(f)
+
+        # concatenate tokens
+        x = Concatenate(axis=1)(multi_feats)
+
+        # project back to correct dimension (128)
+        x = self.fuse(x)
+
+        return x
+
+class TransformerBlock(Layer):
+
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=4):
+
+        super().__init__()
+
+        self.attn = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=embed_dim
+        )
+
+        self.norm1 = LayerNormalization()
+
+        self.norm2 = LayerNormalization()
+
+        self.ffn = tf.keras.Sequential([
+            Dense(embed_dim*2,
+                  activation='gelu'),
+            Dense(embed_dim)
+        ])
+
+    def call(self, x):
+
+        a = self.attn(x,x)
+
+        x = self.norm1(x+a)
+
+        f = self.ffn(x)
+
+        x = self.norm2(x+f)
+
+        return x
+
+ 
+class CrossAttentionFusion(Layer):
+
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=4):
+        super().__init__()
+
+        self.attn = MultiHeadAttention(
+            num_heads=num_heads,
+            key_dim=embed_dim
+        )
+
+        self.norm = LayerNormalization()
+
+    def call(self, cnn_feat, vit_feat):
+
+        cnn_feat = tf.expand_dims(cnn_feat, axis=1)
+        vit_feat = tf.expand_dims(vit_feat, axis=1)
+
+        attn_out = self.attn(
+            query=cnn_feat,
+            key=vit_feat,
+            value=vit_feat
+        )
+
+        fused = self.norm(attn_out + cnn_feat)
+
+        return tf.squeeze(fused, axis=1)
+
+
+def get_hybrid_modelVGGG(input_shape):
+
+    inputs = Input(shape=input_shape)
+
   
 
-    x = VGGBlock(num_convs=1, filters=32)(x)
- 
-    x = SEBlock()(x)
-    x = VGGBlock(num_convs=1, filters=64)(x)  
-   
-    x = SEBlock()(x)  
-    x = VGGBlock(num_convs=1, filters=128)(x)
- 
-    x = SEBlock()(x)
-    x = VGGBlock(num_convs=1, filters=256)(x) 
-    
-    x = SEBlock()(x) 
+    cnn = Conv2D(32, 3, padding='same', activation='relu')(inputs)
+
+    cnn = VGGBlock(32, num_convs=2)(cnn)
+    cnn = SEBlock()(cnn)
+
+    cnn = VGGBlock(64, num_convs=2)(cnn)
+    cnn = SEBlock()(cnn)
+
+    cnn = Conv2D(128, 3, padding='same', activation='relu')(cnn)
+
+    cnn = GlobalAveragePooling2D()(cnn)
 
 
-    
 
+    vit = MultiScalePatchEmbedding(
+        embed_dim=128,
+        patch_sizes=[8, 16, 32]
+    )(inputs)
 
-    x = Flatten()(x)
-    x = Dense(512)(x)
-    x = LeakyReLU(alpha=0.05)(x)
-    x = Dropout(0.05)(x)
-    x = Dense(3, activation='softmax')(x)
-    model = Model(inputs=[input_img], outputs=[x])
+    vit = TransformerBlock(
+        embed_dim=128,
+        num_heads=4
+    )(vit)
+
+    vit = TransformerBlock(
+        embed_dim=128,
+        num_heads=4
+    )(vit)
+
+    vit = GlobalAveragePooling1D()(vit)
+
+    fusion = CrossAttentionFusion(
+    embed_dim=128,
+    num_heads=4
+)(cnn, vit)
+
+    fusion = Concatenate()([
+    fusion,
+    cnn,
+    vit])
+    fusion = Dense(256, activation='relu')(fusion)
+    fusion = Dropout(0.3)(fusion)
+    fusion = Dense(128, activation='relu')(fusion)
+    fusion = Dropout(0.2)(fusion)
+
+    outputs = Dense(1, activation='sigmoid')(fusion)
+
+    model = Model(inputs, outputs)
+
     return model
-
- 
-
 def compute_multiclass_eer(y_true, y_pred_proba, num_classes):
     class_eers = []
     for i in range(num_classes):
@@ -247,7 +398,7 @@ for fold, (train_index, test_index) in enumerate(kf.split(X_data)):
     X_train, X_val, Y_train, Y_val = train_test_split(X_train_full, Y_train_full, test_size=0.1, random_state=42)
 
   
-    model = get_hybrid_model(input_shape)
+    model = get_hybrid_modelVGGG(input_shape)
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
                   loss='categorical_crossentropy',
                   metrics=['accuracy'])
