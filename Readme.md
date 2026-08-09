@@ -40,11 +40,11 @@ python preprocessing.py --dataset_dir ./dataset --output_dir ./processed_output 
 # 🗂️ Create Class-wise Folders
 # Organize the dataset into folders based on classification type.
 
-# Multi-class:
-python extract_samples.py --dataset_dir ./dataset --processed_dir ./processed_output --output_dir ./DatasetLungs --class_mode multi --offset_start -10 --offset_end 10
+# Binary-class:
+python extract_samples_binary.py --dataset_dir ./dataset --processed_dir ./processed_output --output_dir ./DatasetLungs --offset_start -10 --offset_end 10
 
-# Binary class:
-python extract_samples.py --dataset_dir ./dataset --processed_dir ./processed_output --output_dir ./DatasetLungs --class_mode binary --offset_start -10 --offset_end 10
+# Multi class:
+python extract_samples_multi.py --dataset_dir ./dataset --processed_dir ./processed_output --output_dir ./DatasetLungs  --offset_start -10 --offset_end 10
 
 # 🦵 Preprocess Knee X-ray Dataset
 # Preprocess and generate real and DeepFake Knee X-ray data samples.
@@ -60,13 +60,7 @@ python build_deepfake_data.py --source_root ./Dataset_Knee --output_dir ./KneeMe
 # Ensure paths to the dataset are set correctly inside the scripts.
 # These scripts will train, test, and save the ROC curves, confusion matrix, and training curves.
 
-Additional Test:
-you can consider seperate division i.e., EXP1_Blind and EXP2_OPEN of CT-GAN dataset as train and test sets:
-python generate_patient_slices.py --dataset_dir ./dataset --output_dir ./preprocessed_output1
-and afterthat run:
-python extract_samples.py --dataset_dir ./dataset --processed_dir ./processed_output1/exp1_preprocessed --output_dir ./DatasetLungs/Train/ --class_mode binary --offset_start -10 --offset_end 10
-python extract_samples.py --dataset_dir ./dataset --processed_dir ./processed_output1/exp2_preprocessed --output_dir ./DatasetLungs/Test/ --class_mode binary --offset_start -10 --offset_end 10
-After that, run file model_exp1-exp2.py.
+
 
 
 **NOte**: you can install dependencies as pip install -r requirements.txt
