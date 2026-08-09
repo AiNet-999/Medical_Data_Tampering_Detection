@@ -43,7 +43,7 @@ def save_slices(scan_uuid, scan_data, dicom_slices, tampered_df, output_base_dir
 
 def load_dicom(path2scan_dir):
     dcms = os.listdir(path2scan_dir)
-    first_slice_data = pydicom.read_file(os.path.join(path2scan_dir, dcms[0]))
+    first_slice_data = pydicom.dcmread(os.path.join(path2scan_dir, dcms[0]))
     first_slice = first_slice_data.pixel_array
     spacing_xy = np.array(first_slice_data.PixelSpacing, dtype=float)
     spacing_z = np.float64(first_slice_data.SliceThickness)
@@ -53,7 +53,7 @@ def load_dicom(path2scan_dir):
     indexes = []
 
     for dcm in dcms:
-        slice_data = pydicom.read_file(os.path.join(path2scan_dir, dcm))
+        slice_data = pydicom.dcmread(os.path.join(path2scan_dir, dcm))
         slice_data.filename = dcm
         raw_slices.append(slice_data)
         indexes.append(float(slice_data.ImagePositionPatient[2]))
