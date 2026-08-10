@@ -1,55 +1,81 @@
 import os
 import random
 import warnings
+from itertools import cycle
+
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import seaborn as sns
+import tensorflow as tf
+from keras.utils import to_categorical
+from sklearn.metrics import (
+    accuracy_score,
+    auc,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.preprocessing import label_binarize
+from tensorflow.keras import backend as K
+from tensorflow.keras.callbacks import CSVLogger, EarlyStopping
+from tensorflow.keras.layers import (
+    Add,
+    BatchNormalization,
+    Concatenate,
+    Conv2D,
+    Dense,
+    Dropout,
+    Flatten,
+    GlobalAveragePooling1D,
+    GlobalAveragePooling2D,
+    Input,
+    Layer,
+    LayerNormalization,
+    LeakyReLU,
+    MaxPooling2D,
+    MultiHeadAttention,
+    Multiply,
+    Reshape,
+    SpatialDropout2D,
+)
+from tensorflow.keras.models import Model
+from tensorflow.keras.regularizers import l2
+
 
 SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
 os.environ['TF_DETERMINISTIC_OPS'] = '1'
 random.seed(SEED)
 np.random.seed(SEED)
-
-import tensorflow as tf
 tf.random.set_seed(SEED)
-
-from tensorflow.keras import backend as K
-from tensorflow.keras.layers import (
-    Input, Conv2D, MaxPooling2D, Flatten, Dense, Dropout, Reshape,
-    LeakyReLU, GlobalAveragePooling2D, GlobalAveragePooling1D, Multiply,
-    Layer, MultiHeadAttention, LayerNormalization, BatchNormalization, Add, Concatenate
-)
-from tensorflow.keras.models import Model
-from tensorflow.keras.callbacks import EarlyStopping, CSVLogger
-
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    matthews_corrcoef, roc_curve, roc_auc_score, confusion_matrix, classification_report
-)
 
 warnings.filterwarnings('ignore')
 
 
 
 def load_and_preprocess_images(directory, label, img_rows=224, img_cols=224):
-    images, labels = [], []
-    if not os.path.exists(directory):
-        print(f"Warning: Directory not found: {directory}")
-        return images, labels
-        
-    files = os.listdir(directory)
-    for f in files:
-        file_path = os.path.join(directory, f)
-        img = cv2.imread(file_path, 1)
-        if img is not None:
-            img = cv2.resize(img, (img_rows, img_cols))
-            images.append(img)
-            labels.append(label)
+    images = []
+    labels = []
+    if os.path.exists(directory):
+        files = os.listdir(directory)
+        for f in files:
+            img_path = os.path.join(directory, f)
+            img = cv2.imread(img_path, 1)
+            if img is not None:
+                img = cv2.resize(img, (img_rows, img_cols))
+                images.append(img)
+                labels.append(label)
     return images, labels
+
 
 train_dirs = {
     '/content/DatasetLungs/Train/Real': 0,
@@ -64,15 +90,18 @@ test_dirs = {
 X_train, Y_train = [], []
 X_test, Y_test = [], []
 
+
 for directory, label in train_dirs.items():
     images, labels = load_and_preprocess_images(directory, label, img_rows=224, img_cols=224)
     X_train.extend(images)
     Y_train.extend(labels)
 
+
 for directory, label in test_dirs.items():
     images, labels = load_and_preprocess_images(directory, label, img_rows=224, img_cols=224)
     X_test.extend(images)
     Y_test.extend(labels)
+
 
 X_train = np.array(X_train)
 Y_train = np.array(Y_train)
@@ -80,7 +109,7 @@ X_test = np.array(X_test)
 Y_test = np.array(Y_test)
 
 img_rows, img_cols = 224, 224
-if tf.keras.backend.image_data_format() == 'channels_first':
+if K.image_data_format() == 'channels_first':
     X_train = X_train.reshape(X_train.shape[0], 3, img_rows, img_cols)
     X_test = X_test.reshape(X_test.shape[0], 3, img_rows, img_cols)
     input_shape = (3, img_rows, img_cols)
@@ -95,14 +124,6 @@ X_test = X_test.astype('float32') / 255.0
 print(f"Training data shape: {X_train.shape}")
 print(f"Testing data shape: {X_test.shape}")
 
-# Split validation set from training data
-X_train, X_valid, Y_train, Y_valid = train_test_split(
-    X_train,
-    Y_train,
-    test_size=0.1,
-    random_state=SEED,
-    stratify=Y_train
-)
 
 class ResNetBlock(Layer):
     def __init__(self, filters, stride=1, **kwargs):
@@ -114,6 +135,7 @@ class ResNetBlock(Layer):
         self.act1 = LeakyReLU(0.05)
         self.conv2 = Conv2D(filters, 3, padding='same', use_bias=False)
         self.bn2 = LayerNormalization()
+        self.shortcut = None
 
     def build(self, input_shape):
         in_channels = input_shape[-1]
@@ -134,7 +156,8 @@ class ResNetBlock(Layer):
         x = self.conv2(x)
         x = self.bn2(x)
         x = Add()([x, shortcut])
-        return LeakyReLU(0.05)(x)
+        x = LeakyReLU(0.05)(x)
+        return x
 
 class SEBlock(Layer):
     def __init__(self, ratio=16, **kwargs):
@@ -156,6 +179,7 @@ class SEBlock(Layer):
         s = self.reshape(s)
         return Multiply()([x, s])
 
+
 class MultiScalePatchEmbedding(Layer):
     def __init__(self, embed_dim=128, patch_sizes=[8, 16, 32], **kwargs):
         super().__init__(**kwargs)
@@ -176,7 +200,8 @@ class MultiScalePatchEmbedding(Layer):
             f = tf.reshape(f, (-1, h * w, tf.shape(f)[-1]))
             multi_feats.append(f)
         x = Concatenate(axis=1)(multi_feats)
-        return self.fuse(x)
+        x = self.fuse(x)
+        return x
 
 class TransformerBlock(Layer):
     def __init__(self, embed_dim=128, num_heads=4, **kwargs):
@@ -193,7 +218,8 @@ class TransformerBlock(Layer):
         a = self.attn(x, x)
         x = self.norm1(x + a)
         f = self.ffn(x)
-        return self.norm2(x + f)
+        x = self.norm2(x + f)
+        return x
 
 class CrossAttentionFusion(Layer):
     def __init__(self, embed_dim=128, num_heads=4, **kwargs):
@@ -209,10 +235,9 @@ class CrossAttentionFusion(Layer):
         return tf.squeeze(fused, axis=1)
 
 
-
 def get_hybrid_modelResNet(input_shape):
-    inputs = Input(shape=input_shape)
 
+    inputs = Input(shape=input_shape)
     cnn = Conv2D(32, 3, padding='same', activation='relu')(inputs)
     cnn = ResNetBlock(32)(cnn)
     cnn = ResNetBlock(32)(cnn)
@@ -233,46 +258,65 @@ def get_hybrid_modelResNet(input_shape):
     vit = TransformerBlock(embed_dim=128, num_heads=4)(vit)
     vit = GlobalAveragePooling1D()(vit)
 
-
+  
     fusion = CrossAttentionFusion(embed_dim=128, num_heads=4)(cnn, vit)
     fusion = Concatenate()([fusion, cnn, vit])
-
-   
     fusion = Dense(256, activation='relu')(fusion)
     fusion = Dropout(0.3)(fusion)
     fusion = Dense(128, activation='relu')(fusion)
     fusion = Dropout(0.2)(fusion)
 
     outputs = Dense(1, activation='sigmoid')(fusion)
+    model = Model(inputs, outputs, name="Hybrid_Model_ResNet")
+    return model
 
-    return Model(inputs, outputs, name="Hybrid_ResNet_ViT_CrossAttention")
 
 model = get_hybrid_modelResNet(input_shape)
+
 model.compile(
-    optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+    optimizer=tf.keras.optimizers.Adam(learning_rate=0.00001),
     loss='binary_crossentropy',
     metrics=['accuracy']
 )
 
-callbacks = [
-    EarlyStopping(monitor='val_accuracy', patience=5, restore_best_weights=True)
-]
+
+X_train, X_valid, Y_train, Y_valid = train_test_split(
+    X_train,
+    Y_train,
+    test_size=0.1,
+    random_state=42,
+    stratify=Y_train
+)
+
+metrics = {
+    'accuracy': [],
+    'precision': [],
+    'recall': [],
+    'f1_score': [],
+    'eer': [],
+    'mcc': []
+}
+
+early_stopping = EarlyStopping(
+    monitor='val_accuracy',
+    patience=5,
+    restore_best_weights=True
+)
+
 
 history = model.fit(
     X_train, Y_train,
     batch_size=8,
     epochs=50,
     validation_data=(X_valid, Y_valid),
-    callbacks=callbacks
+    callbacks=[early_stopping]
 )
-
-
 
 def compute_eer(y_true, y_scores):
     fpr, tpr, thresholds = roc_curve(y_true, y_scores)
     fnr = 1 - tpr
-    eer_index = np.nanargmin(np.abs(fnr - fpr))
-    return fnr[eer_index]
+    eer = fnr[np.nanargmin(np.abs(fnr - fpr))]
+    return eer
 
 y_pred_proba = model.predict(X_test).flatten()
 y_pred = (y_pred_proba > 0.5).astype(int)
@@ -284,15 +328,20 @@ f1 = f1_score(Y_test, y_pred)
 eer = compute_eer(Y_test, y_pred_proba)
 mcc = matthews_corrcoef(Y_test, y_pred)
 
-print("\n" + "="*40)
-print("TEST EVALUATION RESULTS")
-print("="*40)
-print(f"Accuracy:  {accuracy:.4f}")
-print(f"Precision: {precision:.4f}")
-print(f"Recall:    {recall:.4f}")
-print(f"F1-Score:  {f1:.4f}")
-print(f"EER:       {eer:.4f}")
-print(f"MCC:       {mcc:.4f}")
+metrics['accuracy'].append(accuracy)
+metrics['precision'].append(precision)
+metrics['recall'].append(recall)
+metrics['f1_score'].append(f1)
+metrics['eer'].append(eer)
+metrics['mcc'].append(mcc)
 
-print("\nClassification Report:\n")
-print(classification_report(Y_test, y_pred, target_names=['Real', 'Deepfake']))
+print(f"\nAccuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1-Score: {f1:.4f}, EER: {eer:.4f}, MCC: {mcc:.4f}\n")
+
+predicted_probabilities = y_pred_proba
+class_report = classification_report(Y_test, y_pred, target_names=['Real', 'Deepfake'])
+print("Classification Report:\n", class_report)
+
+print("\nOverall Metrics:")
+for metric, values in metrics.items():
+    mean = np.mean(values)
+    print(f"{metric.capitalize()}: {mean:.4f}")
